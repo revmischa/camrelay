@@ -1,34 +1,51 @@
 #!/usr/bin/perl
-use strict;
-use warnings;
+
+use Moose;
+
+# needed to handle client disconnections properly
+# https://github.com/miyagawa/Twiggy/issues/7
+use EV;
+
 use Tatsumaki::Error;
 use Tatsumaki::Application;
 use Tatsumaki::HTTPClient;
-use JSON;
 
 package CamHandler;
 
-use base qw(Tatsumaki::Handler);
+use Moose;
+use MooseX::NonMoose;
+extends 'Tatsumaki::Handler';
+
 use AnyEvent;
 use AnyEvent::HTTP;
 use Tatsumaki::MessageQueue;
+use Encode;
 
 __PACKAGE__->asynchronous(1);
 
 our $receiver = AnyEvent->condvar;
 our $client_id = 1;
 
-sub prepare {
-    my ($self) = @_;
+$Tatsumaki::MessageQueue::BacklogLength = 1;
 
+start_reading();
+
+sub start_reading {
     my $url = "http://127.0.0.1:8888/mjpg/video.mjpg";
     my %opts = (
-                on_header => sub { return $self->got_headers(@_); },
-                on_body  => sub { return $self->got_body(@_);},
+                on_header => \&got_headers,
+                on_body  => \&got_body,
     );
     
-    http_get $url, %opts, $self->async_cb(sub { $self->body_finished(@_) });
+    http_get $url, %opts, \&body_finished;
 }
+
+around 'finish' => sub {
+    my ($orig, $self, @extra) = @_;
+
+    warn "finished";
+    return $self->$orig(@extra);
+};
 
 sub get {
     my($self, $query) = @_;
@@ -37,50 +54,90 @@ sub get {
     $self->response->header(connection => 'close');
 
     my $mq = Tatsumaki::MessageQueue->instance('cam');
-    $mq->poll($client_id++, sub {
+    my $_client_id = $client_id++;
+    $self->{_client_id} = $_client_id;
+
+    $mq->poll($_client_id, sub {
         my @events = @_;
         for my $event (@events) {
-            $self->stream_write($event->{data});
+            my $type = $event->{type};
+            my $data = $event->{data};
+
+            if ($type eq 'mjpg-part') {
+                $self->stream_write($data);
+            } elsif ($type eq 'status') {
+                $self->response->status($event->{status});
+            } elsif ($type eq 'error') {
+                Tatsumaki::Error::HTTP->throw($event->{status}, $event->{reason});
+                $self->finish;
+              
+            } elsif ($type eq 'finish') {
+                $self->finish;
+            } else {
+                warn "unknown event: $type";
+            }
         }
     });
 
     return 1;
 }
 
+# this disables the default mechanism of encoding output into
+# utf8. image data shouldn't be.
+
+sub get_chunk { return $_[1] }
+
 sub body_finished {
-    my ($self, $res, $hdr) = @_;
+    my ($res, $h) = @_;
+
+    my $mq = Tatsumaki::MessageQueue->instance('cam');
 
     use Data::Dumper;
-    warn "finished, hdr: " . Dumper($hdr);
+    warn "finished, hdr: " . Dumper($h);
 
-    if ($hdr->{Status} !~ /^2/) {
-        Tatsumaki::Error::HTTP->throw($hdr->{Status}, $hdr->{Reason});
+    if ($h->{Status} !~ /^2/) {
+        $mq->publish({
+            type => "error",
+            status => $h->{Status},
+            reason => $h->{Reason},
+        });
+
+        return;
     }
 
-    $self->finish;
+    $mq->publish({
+        type => "finish",
+    });
 }
 
 # h = hashref of headers
 sub got_headers {
-    my ($self, $h) = @_;
+    my ($h) = @_;
 
-    use Data::Dumper;
-    warn Dumper($h);
+    my $mq = Tatsumaki::MessageQueue->instance('cam');
 
     if ($h->{Status} !~ /^2/) {
-        Tatsumaki::Error::HTTP->throw($h->{Status}, $h->{Reason});
+        $mq->publish({
+            type => "error",
+            status => $h->{Status},
+            reason => $h->{Reason},
+        });
+
+        return;
     }
 
-    $self->response->status($h->{Status});
+    $mq->publish({
+        type => "status",
+        status => $h->{Status},
+    });
 
     return 1;
 }
 
 sub got_body {
-    my ($self, $partial_body, $headers) = @_;
+    my ($partial_body, $headers) = @_;
 
     my $mq = Tatsumaki::MessageQueue->instance('cam');
-    warn "got_body";
     $mq->publish({
         type => "mjpg-part",
         data => $partial_body,
